@@ -59,6 +59,52 @@ Una hoja (por defecto llamada `REVISAR`) con tres columnas:
 | ---------------- | --------------- | ------------- |
 | 12               | PHILIPS         | TP 300        |
 
+## Enriquecimiento con EUDAMED
+
+Opcionalmente puedes consultar la API pública de
+[EUDAMED](https://ec.europa.eu/tools/eudamed/) para rellenar `TRADE_NAME`,
+`UDI_DI`, `BASIC_UDI_DI`, `CLASE_RIESGO` y las columnas estilo Machida
+`Encontrado en EUDAMED`, `Nombre comercial EUDAMED`, `Link de referencia`,
+etc. Requiere acceso a `ec.europa.eu` desde la máquina donde lo ejecutes
+(esto no funciona en el entorno remoto de Claude Code on the web por la
+allowlist de red — hay que correrlo en local).
+
+```bash
+pip install requests
+
+# Sólo para las marcas más grandes y como prueba (50 lookups máx):
+python clean_brands_models.py \
+    --input  data/Marcas_y_modelos_en_uso__EQ_ELECTROMEDICO.xlsx \
+    --output output/Marcas_y_modelos_LIMPIO.xlsx \
+    --eudamed \
+    --eudamed-brands "MACHIDA" "PHILIPS" \
+    --eudamed-max-lookups 50
+```
+
+Opciones:
+
+- `--eudamed` — activa el lookup. Sólo consulta combinaciones únicas
+  `(MARCA_LIMPIA, PROPUESTA_MODELO)`, no fila por fila.
+- `--eudamed-cache PATH` — fichero JSON donde guardar/recuperar respuestas
+  (default `output/.eudamed_cache.json`). Re-ejecuciones reaprovechan cache.
+- `--eudamed-brands PHILIPS MACHIDA ...` — limita a esas marcas.
+- `--eudamed-only-missing` — sólo modelos que aún no tienen `UDI_DI`.
+- `--eudamed-max-lookups N` — corta tras N consultas (útil para pruebas).
+- `--eudamed-delay 0.4` — pausa entre peticiones en segundos.
+
+Si la API de EUDAMED cambia su contrato, el código está pensado para que
+sólo haya que tocar la URL base y el extractor en `eudamed_client.py`
+(`DEFAULT_BASE_URL` y la función `_flatten`).
+
+## Tests
+
+```bash
+pip install pytest
+pytest tests/
+```
+
+Los tests de EUDAMED no tocan la red: usan un `transport` mockeado.
+
 ## Personalización
 
 - **Aliases de marca**: edita el diccionario `BRAND_ALIASES` en

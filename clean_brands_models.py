@@ -30,12 +30,15 @@ import unicodedata
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 from rapidfuzz import fuzz, process
+
+from eudamed_client import EudamedClient
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +253,63 @@ OUTPUT_COLUMNS = [
     "TRADE_NAME", "BASIC_UDI_DI", "UDI_DI", "CLASE_RIESGO",
     "STATUS", "FUENTE", "OBSERVACIONES", "WEB_SCORE",
 ]
+
+
+def enrich_with_eudamed(out: pd.DataFrame,
+                        client: EudamedClient,
+                        only_missing: bool = False,
+                        max_lookups: Optional[int] = None,
+                        only_brands: Optional[set[str]] = None) -> int:
+    """Enriquece `out` in-place con datos de EUDAMED.
+
+    Sólo consulta combinaciones únicas (MARCA_LIMPIA, PROPUESTA_MODELO) y
+    propaga el resultado a todas las filas que coincidan.
+
+    Devuelve el número de combinaciones consultadas.
+    """
+    mask_target = out["PROPUESTA_MODELO"].notna() & (out["PROPUESTA_MODELO"] != "")
+    if only_missing:
+        mask_target &= out["UDI_DI"].isna() | (out["UDI_DI"] == "")
+    if only_brands:
+        mask_target &= out["MARCA_LIMPIA"].isin(only_brands)
+
+    pairs = (out.loc[mask_target, ["MARCA_LIMPIA", "PROPUESTA_MODELO"]]
+                .dropna().drop_duplicates())
+    if max_lookups is not None:
+        pairs = pairs.head(max_lookups)
+
+    print(f"  Consultas únicas a EUDAMED: {len(pairs)}")
+
+    # Cache por (marca, modelo) -> dict aplanado
+    results: dict[tuple[str, str], Optional[dict]] = {}
+    for i, (_, row) in enumerate(pairs.iterrows(), 1):
+        brand = row["MARCA_LIMPIA"]
+        model = row["PROPUESTA_MODELO"]
+        results[(brand, model)] = client.lookup(brand, model)
+        if i % 50 == 0:
+            print(f"    {i}/{len(pairs)} ({brand} {model})")
+    client.flush()
+
+    # Propagación a las filas
+    for (brand, model), hit in results.items():
+        if not hit:
+            continue
+        mask = (out["MARCA_LIMPIA"] == brand) & (out["PROPUESTA_MODELO"] == model)
+        out.loc[mask, "TRADE_NAME"] = hit.get("trade_name") or ""
+        out.loc[mask, "UDI_DI"] = hit.get("udi_di") or ""
+        out.loc[mask, "BASIC_UDI_DI"] = hit.get("basic_udi_di") or ""
+        out.loc[mask, "CLASE_RIESGO"] = hit.get("risk_class") or ""
+        out.loc[mask, "FUENTE"] = "EUDAMED"
+        out.loc[mask, "Encontrado en EUDAMED (según extracto)"] = (
+            "Sí" if hit.get("brand_matched") else "Parcial"
+        )
+        out.loc[mask, "Nombre comercial EUDAMED (si aplica)"] = hit.get("trade_name") or ""
+        out.loc[mask, "UDI-DI (completo)"] = hit.get("udi_di") or ""
+        out.loc[mask, "Basic UDI-DI (si aplica)"] = hit.get("basic_udi_di") or ""
+        out.loc[mask, "Fuente (EUDAMED / web)"] = "EUDAMED"
+        out.loc[mask, "Verificado en internet (fabricante/distribuidor)"] = "Sí (EUDAMED)"
+        out.loc[mask, "Link de referencia"] = "EUDAMED"
+    return len(pairs)
 
 
 def process_dataframe(df: pd.DataFrame, fuzzy_threshold: int = 92) -> pd.DataFrame:
@@ -509,6 +569,26 @@ def main() -> None:
     parser.add_argument("--fuzzy-threshold", type=int, default=92,
                         help="Umbral 0-100 de similitud para proponer "
                              "corrección por fuzzy matching (default: 92)")
+    parser.add_argument("--eudamed", action="store_true",
+                        help="Enriquece el resultado consultando EUDAMED. "
+                             "Requiere acceso a ec.europa.eu y la librería "
+                             "`requests` instalada.")
+    parser.add_argument("--eudamed-cache", type=Path,
+                        default=Path("output/.eudamed_cache.json"),
+                        help="Fichero JSON de cache para las respuestas de "
+                             "EUDAMED (default: output/.eudamed_cache.json)")
+    parser.add_argument("--eudamed-only-missing", action="store_true",
+                        help="Sólo consulta EUDAMED para las filas que aún "
+                             "no tienen UDI_DI rellenado.")
+    parser.add_argument("--eudamed-max-lookups", type=int, default=None,
+                        help="Límite máximo de consultas únicas a EUDAMED "
+                             "(útil para pruebas; default: sin límite).")
+    parser.add_argument("--eudamed-brands", nargs="+", default=None,
+                        help="Restringe el lookup EUDAMED a las marcas "
+                             "indicadas (MARCA_LIMPIA exacta).")
+    parser.add_argument("--eudamed-delay", type=float, default=0.4,
+                        help="Pausa mínima entre peticiones a EUDAMED, en "
+                             "segundos (default: 0.4).")
     args = parser.parse_args()
 
     print(f"Leyendo {args.input} (hoja '{args.sheet}')...")
@@ -521,6 +601,21 @@ def main() -> None:
 
     print("Procesando...")
     out = process_dataframe(df, fuzzy_threshold=args.fuzzy_threshold)
+
+    if args.eudamed:
+        print("Consultando EUDAMED...")
+        client = EudamedClient(
+            cache_path=args.eudamed_cache,
+            request_delay=args.eudamed_delay,
+        )
+        only_brands = set(args.eudamed_brands) if args.eudamed_brands else None
+        n = enrich_with_eudamed(
+            out, client,
+            only_missing=args.eudamed_only_missing,
+            max_lookups=args.eudamed_max_lookups,
+            only_brands=only_brands,
+        )
+        print(f"  EUDAMED: {n} consultas únicas realizadas")
 
     print(f"Escribiendo {args.output}...")
     write_excel(out, args.output)
